@@ -24,9 +24,9 @@ type Settings struct {
 	TelegramChannelID int64 `json:"telegram_channel_id"`
 }
 
-// LastPostData stores information about the last posted messages
+// LastPostData stores information about the last posted message
 type LastPostData struct {
-	LastPostURL string `json:"last_post_url"`
+	LastPostURL string `json:"last_post_url"` // URL of the last posted news item
 }
 
 // NewsItem represents a news item
@@ -213,7 +213,9 @@ func loadLastPostData() (*LastPostData, error) {
 
 	// If file doesn't exist, return an empty struct
 	if _, err := os.Stat(lastPostPath); os.IsNotExist(err) {
-		return &LastPostData{}, nil
+		return &LastPostData{
+			LastPostURL: "",
+		}, nil
 	}
 
 	data, err := os.ReadFile(lastPostPath)
@@ -244,33 +246,6 @@ func saveLastPostData(lastPostData *LastPostData) error {
 	return nil
 }
 
-// formatNewsContent formats the Wonder Days section content with proper line breaks
-func formatNewsContent(content string) string {
-	// First, trim all whitespace
-	content = strings.TrimSpace(content)
-
-	// Apply specific formatting for Wonder Days
-	// Add line break after "Wonder Days" and similar patterns
-	content = strings.ReplaceAll(content, "!", "!\n")
-	content = strings.ReplaceAll(content, "March:", "March:\n")
-
-	// Add line breaks after data values
-	content = strings.ReplaceAll(content, "MB", "MB\n")
-	content = strings.ReplaceAll(content, "MIN", "MIN\n")
-	content = strings.ReplaceAll(content, "Days", "Days\n\n")
-
-	// Add line breaks after other key elements
-	content = strings.ReplaceAll(content, "OK", "OK\n")
-	content = strings.ReplaceAll(content, "app", "app\n\n")
-
-	// Clean up any excess line breaks
-	for strings.Contains(content, "\n\n\n") {
-		content = strings.ReplaceAll(content, "\n\n\n", "\n\n")
-	}
-
-	return content
-}
-
 func sendToTelegram(botToken string, channelID int64, newsItem NewsItem) error {
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
@@ -284,7 +259,7 @@ func sendToTelegram(botToken string, channelID int64, newsItem NewsItem) error {
 	content := newsItem.SectionContent
 
 	// Format message with proper spacing
-	message := fmt.Sprintf("📢 Wonder Days at Magticom\n\n📅 %s\n\n%s\n\n🔗 %s",
+	message := fmt.Sprintf("📅 %s\n\n%s\n\n🔗 %s",
 		dateText, content, newsItem.URL)
 
 	// Use plain text mode
@@ -320,37 +295,32 @@ func fetchWonderDaysNews() ([]NewsItem, error) {
 
 	// Find news items in the specified selector
 	doc.Find("#article > article > div.post-listing.top-line > div > a").Each(func(i int, s *goquery.Selection) {
-		title := strings.TrimSpace(s.Text())
-
-		// Check if this is a "Wonder Days" post
-		if strings.Contains(title, "Wonder Days") {
-			url, exists := s.Attr("href")
-			if exists {
-				// Make relative URLs absolute
-				if !strings.HasPrefix(url, "http") {
-					url = "https://www.magticom.ge/" + strings.TrimPrefix(url, "/")
-				}
-
-				// Extract date from the post listing
-				dateStr := s.Find("span.post-date").Text()
-
-				newsItem := NewsItem{
-					Title: "Wonder Days",
-					URL:   url,
-					Date:  dateStr,
-				}
-
-				// Fetch the full article content
-				content, sectionContent, err := fetchArticleContent(url)
-				if err != nil {
-					log.Printf("Warning: couldn't fetch article content: %v", err)
-				} else {
-					newsItem.Text = content
-					newsItem.SectionContent = sectionContent
-				}
-
-				wonderDaysItems = append(wonderDaysItems, newsItem)
+		url, exists := s.Attr("href")
+		if exists {
+			// Make relative URLs absolute
+			if !strings.HasPrefix(url, "http") {
+				url = "https://www.magticom.ge/" + strings.TrimPrefix(url, "/")
 			}
+
+			// Extract date from the post listing
+			dateStr := s.Find("span.post-date").Text()
+
+			newsItem := NewsItem{
+				Title: strings.TrimSpace(s.Text()),
+				URL:   url,
+				Date:  dateStr,
+			}
+
+			// Fetch the full article content
+			content, sectionContent, err := fetchArticleContent(url)
+			if err != nil {
+				log.Printf("Warning: couldn't fetch article content: %v", err)
+			} else {
+				newsItem.Text = content
+				newsItem.SectionContent = sectionContent
+			}
+
+			wonderDaysItems = append(wonderDaysItems, newsItem)
 		}
 	})
 
@@ -377,6 +347,11 @@ func parseHtmlContent(htmlContent string) string {
 		text := strings.TrimSpace(s.Text())
 		if text == "" {
 			return
+		}
+
+		// Replace Georgian Lari icon with the proper symbol
+		if s.Find("span.icon-gel").Length() > 0 {
+			text = strings.TrimSpace(text) + " ₾"
 		}
 
 		switch tagName {
@@ -451,7 +426,8 @@ func printInstructions() {
 	fmt.Println("   Format:")
 	fmt.Println(`   {
      "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN"
-   }`)
+     }`)
+	fmt.Println("   To obtain, create a Telegram bot by talking to @BotFather and get the token")
 
 	// Settings file
 	fmt.Println("\n2. Settings file (for the channel ID):")
@@ -460,12 +436,9 @@ func printInstructions() {
 	fmt.Println(`   {
      "telegram_channel_id": YOUR_CHANNEL_ID_NUMBER
    }`)
-
-	fmt.Println("\nTo obtain these values:")
-	fmt.Println("1. Create a Telegram bot by talking to @BotFather and get the token")
-	fmt.Println("2. Add your bot to the target channel as an administrator")
-	fmt.Println("3. Get your channel ID by forwarding a message from the channel to @userinfobot")
-	fmt.Println("   and using the number in the 'Forwarded from chat' value (including the negative sign)")
+	fmt.Println("   To get it, add your bot to the target channel as an administrator,")
+	fmt.Println("   and forward a message from the channel to @userinfobot.")
+	fmt.Println("   Use the 'Id' number from the 'Forwarded from chat' value (including the negative sign)")
 }
 
 // Run executes the service
@@ -502,30 +475,71 @@ func Run() {
 		return
 	}
 
-	// Process each news item, latest first
-	for i := len(news) - 1; i >= 0; i-- {
-		item := news[i]
+	// Since news are in order from newest to oldest,
+	// we'll post all new items until we find the last posted URL
 
-		// Skip if we already posted this
-		if lastPostData.LastPostURL == item.URL {
-			log.Printf("Skipping already posted item: %s", item.URL)
-			continue
+	var newItems []NewsItem
+	var lastPostURL string
+	foundLastPost := false
+
+	// First, find all new items up to the previously posted one
+	for _, item := range news {
+		if item.URL == lastPostData.LastPostURL {
+			foundLastPost = true
+			break
+		}
+		newItems = append(newItems, item)
+	}
+
+	// If there are new items to post
+	if len(newItems) > 0 {
+		log.Printf("Found %d new Wonder Days items to post", len(newItems))
+
+		// Remember the newest URL to save later
+		lastPostURL = newItems[0].URL
+
+		// Process items from oldest to newest (reverse the slice)
+		for i := len(newItems) - 1; i >= 0; i-- {
+			item := newItems[i]
+
+			log.Printf("Posting to Telegram: %s", item.Title)
+
+			if err := sendToTelegram(secrets.TelegramBotToken, settings.TelegramChannelID, item); err != nil {
+				log.Printf("Error sending to Telegram: %v", err)
+				continue
+			}
+
+			log.Printf("Successfully posted: %s", item.URL)
 		}
 
-		log.Printf("Posting to Telegram: %s", item.Title)
-
-		if err := sendToTelegram(secrets.TelegramBotToken, settings.TelegramChannelID, item); err != nil {
-			log.Printf("Error sending to Telegram: %v", err)
-			continue
-		}
-
-		// Update last posted URL
-		lastPostData.LastPostURL = item.URL
+		// Save the newest posted URL
+		lastPostData.LastPostURL = lastPostURL
 		if err := saveLastPostData(lastPostData); err != nil {
 			log.Printf("Warning: couldn't update last post URL: %v", err)
 		}
+	} else if !foundLastPost && lastPostData.LastPostURL != "" {
+		// If we didn't find the last post but we have one saved,
+		// it might mean the content structure has changed or the post was removed
+		// In this case, post the newest item and update the lastPostURL
+		log.Printf("Could not find last posted URL (%s). Posting the newest item.", lastPostData.LastPostURL)
+		if len(news) > 0 {
+			newestItem := news[0]
+			log.Printf("Posting to Telegram: %s", newestItem.Title)
 
-		log.Printf("Successfully posted: %s", item.URL)
+			if err := sendToTelegram(secrets.TelegramBotToken, settings.TelegramChannelID, newestItem); err != nil {
+				log.Printf("Error sending to Telegram: %v", err)
+			} else {
+				log.Printf("Successfully posted: %s", newestItem.URL)
+
+				// Update the last post URL
+				lastPostData.LastPostURL = newestItem.URL
+				if err := saveLastPostData(lastPostData); err != nil {
+					log.Printf("Warning: couldn't update last post URL: %v", err)
+				}
+			}
+		}
+	} else {
+		log.Println("No new Wonder Days news to post")
 	}
 }
 
