@@ -5,6 +5,7 @@ go 1.24.1
 require (
 	github.com/PuerkitoBio/goquery v1.10.2
 	github.com/go-telegram-bot-api/telegram-bot-api v4.6.4+incompatible
+	github.com/mattn/go-sqlite3 v1.14.28
 )
 
 require (

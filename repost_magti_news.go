@@ -1,6 +1,7 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -9,9 +10,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/PuerkitoBio/goquery"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api"
+	_ "github.com/mattn/go-sqlite3" // SQLite driver
 )
 
 // Secrets holds only the authentication secrets for the bot
@@ -24,13 +27,8 @@ type Settings struct {
 	TelegramChannelID int64 `json:"telegram_channel_id"`
 }
 
-// LastPostData stores information about the last posted message
-type LastPostData struct {
-	LastPostURL string `json:"last_post_url"` // URL of the last posted news item
-}
-
-// NewsItem represents a news item
-type NewsItem struct {
+// Article represents a news item
+type Article struct {
 	Title          string
 	URL            string
 	Date           string
@@ -40,7 +38,25 @@ type NewsItem struct {
 
 const (
 	magticomNewsURL = "https://www.magticom.ge/en/about-company/news"
+	dbFileName      = "posted_articles.sqlite3"
 )
+
+func getLocalAppDataDir() string {
+	// Default paths based on OS
+	if runtime.GOOS == "windows" {
+		localAppData := os.Getenv("LOCALAPPDATA")
+		if localAppData == "" {
+			log.Panicf("LOCALAPPDATA environment variable is not set")
+		}
+		return localAppData
+	} else {
+		homeDir, err := os.UserHomeDir()
+		if err != nil {
+			log.Panicf("Error getting home directory: %v", err)
+		}
+		return filepath.Join(homeDir, ".local")
+	}
+}
 
 func getDefaultSecretsPath() string {
 	var secretDataDir string
@@ -54,43 +70,82 @@ func getDefaultSecretsPath() string {
 	if dir := os.Getenv("SecretDataDir"); dir != "" {
 		secretDataDir = dir
 	} else {
-		// Default paths based on OS
-		if runtime.GOOS == "windows" {
-			localAppData := os.Getenv("LOCALAPPDATA")
-			secretDataDir = filepath.Join(localAppData, "_sec")
-		} else {
-			homeDir, err := os.UserHomeDir()
-			if err != nil {
-				log.Fatalf("Error getting home directory: %v", err)
-			}
-			secretDataDir = filepath.Join(homeDir, ".local", "_sec")
-		}
+		secretDataDir = filepath.Join(getLocalAppDataDir(), "_sec")
 	}
 
 	return filepath.Join(secretDataDir, "repost_magti_news.json")
 }
 
-func getLastPostDataPath() string {
-	var dataDir string
-
-	// Default paths based on OS
-	if runtime.GOOS == "windows" {
-		localAppData := os.Getenv("LOCALAPPDATA")
-		dataDir = filepath.Join(localAppData, "repost_magti_news")
-	} else {
-		homeDir, err := os.UserHomeDir()
-		if err != nil {
-			log.Fatalf("Error getting home directory: %v", err)
-		}
-		dataDir = filepath.Join(homeDir, ".local", "repost_magti_news")
-	}
+func getDBPath() string {
+	dataDir := filepath.Join(getLocalAppDataDir(), "repost_magti_news")
 
 	// Ensure directory exists
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		log.Fatalf("Error creating data directory: %v", err)
 	}
 
-	return filepath.Join(dataDir, "last_post.json")
+	return filepath.Join(dataDir, dbFileName)
+}
+
+func initDB(dbPath string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("error opening database: %w", err)
+	}
+
+	// Create table with URL and timestamp
+	query := `
+    CREATE TABLE IF NOT EXISTS posted_articles (
+        url TEXT PRIMARY KEY,
+        posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    `
+	_, err = db.Exec(query)
+	if err != nil {
+		return nil, fmt.Errorf("error creating table: %w", err)
+	}
+
+	return db, nil
+}
+
+func isArticlePosted(db *sql.DB, url string) (bool, error) {
+	query := "SELECT 1 FROM posted_articles WHERE url = ?"
+	var exists int
+	err := db.QueryRow(query, url).Scan(&exists)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, fmt.Errorf("error checking if article posted: %w", err)
+	}
+	return true, nil
+}
+
+func markArticleAsPosted(db *sql.DB, url string) error {
+	query := "INSERT INTO posted_articles (url) VALUES (?)"
+	_, err := db.Exec(query, url)
+	return err
+}
+
+func removeOldArticles(db *sql.DB) error {
+	// Delete articles older than one year
+	query := `DELETE FROM posted_articles WHERE posted_at < datetime('now', '-1 year')`
+
+	result, err := db.Exec(query)
+	if err != nil {
+		return fmt.Errorf("error removing old articles: %w", err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("error getting affected rows: %w", err)
+	}
+
+	if rowsAffected > 0 {
+		log.Printf("Removed %d old articles from database", rowsAffected)
+	}
+
+	return nil
 }
 
 func getSettingsPath() string {
@@ -116,21 +171,24 @@ func getSettingsPath() string {
 	return filepath.Join(dataDir, "settings.json")
 }
 
-func loadSecrets() (*Secrets, error) {
-	secretsPath := getDefaultSecretsPath()
-
+func loadFile(filePath string, displayType string) []byte {
 	// Check if file exists
-	if _, err := os.Stat(secretsPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("secrets file not found at %s", secretsPath)
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		log.Panicf(`%s file not found at "%s"`, displayType, filePath)
 	}
 
-	data, err := os.ReadFile(secretsPath)
+	rawdata, err := os.ReadFile(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("error reading secrets file: %v", err)
+		log.Panicf(`error %v reading %s file "%s"`, err, displayType, filePath)
 	}
 
+	return rawdata
+}
+
+func loadSecrets() (*Secrets, error) {
 	var secrets Secrets
-	if err := json.Unmarshal(data, &secrets); err != nil {
+
+	if err := json.Unmarshal(loadFile(getDefaultSecretsPath(), "secrets"), &secrets); err != nil {
 		return nil, fmt.Errorf("error parsing secrets file: %v", err)
 	}
 
@@ -141,42 +199,10 @@ func loadSecrets() (*Secrets, error) {
 	return &secrets, nil
 }
 
-// func saveSecrets(secrets *Secrets) error {
-// 	secretsPath := getDefaultSecretsPath()
-
-// 	// Ensure directory exists
-// 	dir := filepath.Dir(secretsPath)
-// 	if err := os.MkdirAll(dir, 0700); err != nil {
-// 		return fmt.Errorf("error creating directory: %v", err)
-// 	}
-
-// 	data, err := json.MarshalIndent(secrets, "", "  ")
-// 	if err != nil {
-// 		return fmt.Errorf("error marshaling secrets: %v", err)
-// 	}
-
-// 	if err := os.WriteFile(secretsPath, data, 0600); err != nil {
-// 		return fmt.Errorf("error writing secrets file: %v", err)
-// 	}
-
-// 	return nil
-// }
-
 func loadSettings() (*Settings, error) {
-	secretsPath := getSettingsPath()
-
-	// Check if file exists
-	if _, err := os.Stat(secretsPath); os.IsNotExist(err) {
-		return nil, fmt.Errorf("settings file not found at %s", secretsPath)
-	}
-
-	data, err := os.ReadFile(secretsPath)
-	if err != nil {
-		return nil, fmt.Errorf("error reading settings file: %v", err)
-	}
-
 	var settings Settings
-	if err := json.Unmarshal(data, &settings); err != nil {
+
+	if err := json.Unmarshal(loadFile(getSettingsPath(), "settings"), &settings); err != nil {
 		return nil, fmt.Errorf("error parsing settings file: %v", err)
 	}
 
@@ -187,80 +213,21 @@ func loadSettings() (*Settings, error) {
 	return &settings, nil
 }
 
-// func saveSettings(settings *Settings) error {
-// 	secretsPath := getSettingsPath()
-
-// 	// Ensure directory exists
-// 	dir := filepath.Dir(secretsPath)
-// 	if err := os.MkdirAll(dir, 0700); err != nil {
-// 		return fmt.Errorf("error creating directory: %v", err)
-// 	}
-
-// 	data, err := json.MarshalIndent(settings, "", "  ")
-// 	if err != nil {
-// 		return fmt.Errorf("error marshaling settings: %v", err)
-// 	}
-
-// 	if err := os.WriteFile(secretsPath, data, 0600); err != nil {
-// 		return fmt.Errorf("error writing settings file: %v", err)
-// 	}
-
-// 	return nil
-// }
-
-func loadLastPostData() (*LastPostData, error) {
-	lastPostPath := getLastPostDataPath()
-
-	// If file doesn't exist, return an empty struct
-	if _, err := os.Stat(lastPostPath); os.IsNotExist(err) {
-		return &LastPostData{
-			LastPostURL: "",
-		}, nil
-	}
-
-	data, err := os.ReadFile(lastPostPath)
-	if err != nil {
-		return nil, fmt.Errorf("error reading last post data file: %v", err)
-	}
-
-	var lastPostData LastPostData
-	if err := json.Unmarshal(data, &lastPostData); err != nil {
-		return nil, fmt.Errorf("error parsing last post data file: %v", err)
-	}
-
-	return &lastPostData, nil
-}
-
-func saveLastPostData(lastPostData *LastPostData) error {
-	lastPostPath := getLastPostDataPath()
-
-	data, err := json.MarshalIndent(lastPostData, "", "  ")
-	if err != nil {
-		return fmt.Errorf("error marshaling last post data: %v", err)
-	}
-
-	if err := os.WriteFile(lastPostPath, data, 0600); err != nil {
-		return fmt.Errorf("error writing last post data file: %v", err)
-	}
-
-	return nil
-}
-
-func sendToTelegram(botToken string, channelID int64, newsItem NewsItem) error {
+func sendToTelegram(botToken string, channelID int64, article Article) error {
 	bot, err := tgbotapi.NewBotAPI(botToken)
 	if err != nil {
 		return fmt.Errorf("error initializing bot: %v", err)
 	}
 
 	// Format the date nicely
-	dateText := strings.TrimSpace(newsItem.Text)
+	dateText := strings.TrimSpace(article.Text)
 
 	// The section content is already formatted by parseHtmlContent
-	content := newsItem.SectionContent
+	content := article.SectionContent
 
 	// Format message with proper spacing
 	message := fmt.Sprintf("📅 %s\n\n%s\n\n🔗 %s",
-		dateText, content, newsItem.URL)
+		dateText, content, article.URL)
 
 	// Use plain text mode
 	msg := tgbotapi.NewMessageToChannel(fmt.Sprintf("%d", channelID), message)
@@ -273,9 +240,13 @@ func sendToTelegram(botToken string, channelID int64, newsItem NewsItem) error {
 	return nil
 }
 
-func fetchWonderDaysNews() ([]NewsItem, error) {
+func fetchWonderDaysNews() ([]Article, error) {
+	client := &http.Client{
+		Timeout: 120 * time.Second,
+	}
+
 	// Get the news listing page
-	resp, err := http.Get(magticomNewsURL)
+	resp, err := client.Get(magticomNewsURL)
 	if err != nil {
 		return nil, fmt.Errorf("error fetching news page: %v", err)
 	}
@@ -291,7 +262,7 @@ func fetchWonderDaysNews() ([]NewsItem, error) {
 		return nil, fmt.Errorf("error parsing HTML: %v", err)
 	}
 
-	var wonderDaysItems []NewsItem
+	var wonderDaysItems []Article
 
 	// Find news items in the specified selector
 	doc.Find("#article > article > div.post-listing.top-line > div > a").Each(func(i int, s *goquery.Selection) {
@@ -305,22 +276,22 @@ func fetchWonderDaysNews() ([]NewsItem, error) {
 			// Extract date from the post listing
 			dateStr := s.Find("span.post-date").Text()
 
-			newsItem := NewsItem{
+			article := Article{
 				Title: strings.TrimSpace(s.Text()),
 				URL:   url,
 				Date:  dateStr,
 			}
 
 			// Fetch the full article content
-			content, sectionContent, err := fetchArticleContent(url)
+			content, sectionContent, err := fetchArticleContent(client, url)
 			if err != nil {
 				log.Printf("Warning: couldn't fetch article content: %v", err)
 			} else {
-				newsItem.Text = content
-				newsItem.SectionContent = sectionContent
+				article.Text = content
+				article.SectionContent = sectionContent
 			}
 
-			wonderDaysItems = append(wonderDaysItems, newsItem)
+			wonderDaysItems = append(wonderDaysItems, article)
 		}
 	})
 
@@ -383,8 +354,8 @@ func parseHtmlContent(htmlContent string) string {
 	return strings.TrimSpace(content)
 }
 
-func fetchArticleContent(url string) (string, string, error) {
-	resp, err := http.Get(url)
+func fetchArticleContent(client *http.Client, url string) (string, string, error) {
+	resp, err := client.Get(url)
 	if err != nil {
 		return "", "", err
 	}
@@ -457,89 +428,64 @@ func Run() {
 		return
 	}
 
-	lastPostData, err := loadLastPostData()
+	dbPath := getDBPath()
+	db, err := initDB(dbPath)
 	if err != nil {
-		log.Printf("Error loading last post data: %v", err)
-		// Continue anyway, we'll create new data
-		lastPostData = &LastPostData{}
+		log.Fatalf("Error initializing database: %v", err)
+	}
+	defer db.Close()
+
+	if err := removeOldArticles(db); err != nil {
+		log.Printf("Warning: Error removing old articles: %v", err)
 	}
 
-	log.Println("Fetching Wonder Days news from Magticom...")
-	news, err := fetchWonderDaysNews()
+	log.Println("Fetching news from Magticom...")
+	articles, err := fetchWonderDaysNews()
 	if err != nil {
 		log.Fatalf("Error fetching news: %v", err)
 	}
 
-	if len(news) == 0 {
-		log.Println("No Wonder Days news found")
+	if len(articles) == 0 {
+		log.Println("No news found on the page.")
 		return
 	}
 
-	// Since news are in order from newest to oldest,
-	// we'll post all new items until we find the last posted URL
-
-	var newItems []NewsItem
-	var lastPostURL string
-	foundLastPost := false
-
-	// First, find all new items up to the previously posted one
-	for _, item := range news {
-		if item.URL == lastPostData.LastPostURL {
-			foundLastPost = true
-			break
+	var newItemsToPost []Article
+	// News items are fetched newest first. We iterate to find new ones.
+	for _, item := range articles {
+		posted, err := isArticlePosted(db, item.URL)
+		if err != nil {
+			log.Printf("Error checking if article was posted (%s): %v. Skipping.", item.URL, err)
+			continue
 		}
-		newItems = append(newItems, item)
+		if !posted {
+			newItemsToPost = append(newItemsToPost, item)
+		}
 	}
 
-	// If there are new items to post
-	if len(newItems) > 0 {
-		log.Printf("Found %d new Wonder Days items to post", len(newItems))
+	if len(newItemsToPost) > 0 {
+		log.Printf("Found %d new items to post.", len(newItemsToPost))
 
-		// Remember the newest URL to save later
-		lastPostURL = newItems[0].URL
-
-		// Process items from oldest to newest (reverse the slice)
-		for i := len(newItems) - 1; i >= 0; i-- {
-			item := newItems[i]
-
-			log.Printf("Posting to Telegram: %s", item.Title)
+		// Post items from oldest to newest (reverse the slice of new items)
+		for i := len(newItemsToPost) - 1; i >= 0; i-- {
+			item := newItemsToPost[i]
+			log.Printf("Posting to Telegram: %s (%s)", item.Title, item.URL)
 
 			if err := sendToTelegram(secrets.TelegramBotToken, settings.TelegramChannelID, item); err != nil {
-				log.Printf("Error sending to Telegram: %v", err)
+				log.Printf("Error sending to Telegram (%s): %v", item.URL, err)
+				// If sending fails, we don't mark it as posted, so it will be retried next time.
 				continue
 			}
 
 			log.Printf("Successfully posted: %s", item.URL)
-		}
-
-		// Save the newest posted URL
-		lastPostData.LastPostURL = lastPostURL
-		if err := saveLastPostData(lastPostData); err != nil {
-			log.Printf("Warning: couldn't update last post URL: %v", err)
-		}
-	} else if !foundLastPost && lastPostData.LastPostURL != "" {
-		// If we didn't find the last post but we have one saved,
-		// it might mean the content structure has changed or the post was removed
-		// In this case, post the newest item and update the lastPostURL
-		log.Printf("Could not find last posted URL (%s). Posting the newest item.", lastPostData.LastPostURL)
-		if len(news) > 0 {
-			newestItem := news[0]
-			log.Printf("Posting to Telegram: %s", newestItem.Title)
-
-			if err := sendToTelegram(secrets.TelegramBotToken, settings.TelegramChannelID, newestItem); err != nil {
-				log.Printf("Error sending to Telegram: %v", err)
-			} else {
-				log.Printf("Successfully posted: %s", newestItem.URL)
-
-				// Update the last post URL
-				lastPostData.LastPostURL = newestItem.URL
-				if err := saveLastPostData(lastPostData); err != nil {
-					log.Printf("Warning: couldn't update last post URL: %v", err)
-				}
+			if err := markArticleAsPosted(db, item.URL); err != nil {
+				log.Printf(
+					"Error marking article %s as posted: %v.",
+					item.URL, err)
 			}
 		}
 	} else {
-		log.Println("No new Wonder Days news to post")
+		log.Println("No new news to post.")
 	}
 }
 
