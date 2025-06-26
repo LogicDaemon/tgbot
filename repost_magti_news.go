@@ -265,7 +265,7 @@ func fetchWonderDaysNews() ([]Article, error) {
 	var wonderDaysItems []Article
 
 	// Find news items in the specified selector
-	doc.Find("#article > article > div.post-listing.top-line > div > a").Each(func(i int, s *goquery.Selection) {
+	doc.Find(".post-listing a.post-list-item").Each(func(i int, s *goquery.Selection) {
 		url, exists := s.Attr("href")
 		if exists {
 			// Make relative URLs absolute
@@ -274,10 +274,11 @@ func fetchWonderDaysNews() ([]Article, error) {
 			}
 
 			// Extract date from the post listing
-			dateStr := s.Find("span.post-date").Text()
+			dateStr := s.Find(".post-date").Text()
+			titleStr := s.Find(".post-content").Text()
 
 			article := Article{
-				Title: strings.TrimSpace(s.Text()),
+				Title: strings.TrimSpace(titleStr),
 				URL:   url,
 				Date:  dateStr,
 			}
