@@ -95,11 +95,11 @@ func initDB(dbPath string) (*sql.DB, error) {
 
 	// Create table with URL and timestamp
 	query := `
-    CREATE TABLE IF NOT EXISTS posted_articles (
-        url TEXT PRIMARY KEY,
-        posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    `
+	CREATE TABLE IF NOT EXISTS posted_articles (
+		url TEXT PRIMARY KEY,
+		posted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+	);
+	`
 	_, err = db.Exec(query)
 	if err != nil {
 		return nil, fmt.Errorf("error creating table: %w", err)
@@ -311,9 +311,15 @@ func parseHtmlContent(htmlContent string) string {
 	var result strings.Builder
 
 	// Process paragraphs and lists
-	doc.Find("p, ul, li").Each(func(i int, s *goquery.Selection) {
+	doc.Find("p, li, br").Each(func(i int, s *goquery.Selection) {
 		// Get the tag name
 		tagName := goquery.NodeName(s)
+
+		// Handle <br> before checking text (since s.Text() is empty for <br>)
+		if tagName == "br" {
+			result.WriteString("\n")
+			return
+		}
 
 		// Clean up the text
 		text := strings.TrimSpace(s.Text())
@@ -331,8 +337,6 @@ func parseHtmlContent(htmlContent string) string {
 			// For paragraphs, add text followed by two newlines
 			result.WriteString(text)
 			result.WriteString("\n\n")
-		case "ul":
-			// Don't process ul directly, we'll handle li elements
 		case "li":
 			// For list items, add a bullet point
 			result.WriteString("• ")
@@ -346,6 +350,23 @@ func parseHtmlContent(htmlContent string) string {
 
 	// Replace HTML entities
 	content = strings.ReplaceAll(content, "&nbsp;", " ")
+
+	// Remove redundant text phrases
+	for _, text := range []string{
+		"Or via MyMagti app",
+		"Every week receive Wonder Day offers from Magti!",
+		"If you are not using the MyMagti app yet, download it easily.",
+		"continues at Magti!",
+	} {
+		content = strings.ReplaceAll(content, text, "")
+	}
+
+	// Replace some phrases
+	for old, new := range map[string]string{
+		"Don’t miss “MyMagti Hours”!": "#MyMagtiHours",
+	} {
+		content = strings.ReplaceAll(content, old, new)
+	}
 
 	// Clean up any excess newlines
 	for strings.Contains(content, "\n\n\n") {
